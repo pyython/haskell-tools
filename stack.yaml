@@ -2,15 +2,8 @@ resolver: lts-10.0
 
 packages:
 - coinmetrics
-- coinmetrics-cardano
 - coinmetrics-ethereum
 - coinmetrics-export
-- coinmetrics-iota
-- coinmetrics-monero
-- coinmetrics-nem
-- coinmetrics-neo
-- coinmetrics-ripple
-- coinmetrics-stellar
 
 extra-deps:
 #- avro-0.2.0.0
