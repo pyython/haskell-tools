@@ -28,15 +28,8 @@ import System.IO
 import System.IO.Unsafe
 
 import CoinMetrics.BlockChain
-import CoinMetrics.Cardano
 import CoinMetrics.Ethereum
 import CoinMetrics.Ethereum.ERC20
-import CoinMetrics.Iota
-import CoinMetrics.Monero
-import CoinMetrics.Nem
-import CoinMetrics.Neo
-import CoinMetrics.Ripple
-import CoinMetrics.Stellar
 import Hanalytics.Schema
 import Hanalytics.Schema.BigQuery
 import Hanalytics.Schema.Postgres
@@ -62,7 +55,7 @@ main = run =<< O.execParser parser where
 						<*> O.strOption
 							(  O.long "blockchain"
 							<> O.metavar "BLOCKCHAIN"
-							<> O.help "Type of blockchain: ethereum | cardano | monero | nem | neo | ripple | stellar"
+							<> O.help "Type of blockchain: ethereum"
 							)
 						<*> O.option O.auto
 							(  O.long "begin-block"
@@ -93,36 +86,13 @@ main = run =<< O.execParser parser where
 							)
 					)) (O.fullDesc <> O.progDesc "Export blockchain")
 				)
-			<> O.command "export-iota"
-				(  O.info
-					(O.helper <*> (OptionExportIotaCommand
-						<$> O.strOption
-							(  O.long "api-url"
-							<> O.metavar "API_URL"
-							<> O.value "http://127.0.0.1:14265/" <> O.showDefault
-							<> O.help "IOTA API url, like \"http://<host>:<port>/\""
-							)
-						<*> O.strOption
-							(  O.long "sync-db"
-							<> O.metavar "SYNC_DB"
-							<> O.help "Sync DB file"
-							)
-						<*> optionOutput
-						<*> O.option O.auto
-							(  O.long "threads"
-							<> O.value 1 <> O.showDefault
-							<> O.metavar "THREADS"
-							<> O.help "Threads count"
-							)
-					)) (O.fullDesc <> O.progDesc "Export IOTA data")
-				)
 			<> O.command "print-schema"
 				(  O.info
 					(O.helper <*> (OptionPrintSchemaCommand
 						<$> O.strOption
 							(  O.long "schema"
 							<> O.metavar "SCHEMA"
-							<> O.help "Type of schema: ethereum | erc20tokens | cardano | iota | monero | nem | neo | ripple | stellar"
+							<> O.help "Type of schema: ethereum | erc20tokens"
 							)
 						<*> O.strOption
 							(  O.long "storage"
@@ -190,12 +160,6 @@ data OptionCommand
 		, options_threadsCount :: !Int
 		, options_ignoreMissingBlocks :: !Bool
 		}
-	| OptionExportIotaCommand
-		{ options_apiUrl :: !String
-		, options_syncDbFile :: !String
-		, options_outputFile :: !Output
-		, options_threadsCount :: !Int
-		}
 	| OptionPrintSchemaCommand
 		{ options_schema :: !T.Text
 		, options_storage :: !T.Text
@@ -239,25 +203,6 @@ run Options
 			"ethereum" -> do
 				httpRequest <- H.parseRequest $ withDefaultApiUrl "http://127.0.0.1:8545/"
 				return (SomeBlockChain $ newEthereum httpManager httpRequest, 0, -1000) -- very conservative rewrite limit
-			"cardano" -> do
-				httpRequest <- H.parseRequest $ withDefaultApiUrl "http://127.0.0.1:8100/"
-				return (SomeBlockChain $ newCardano httpManager httpRequest, 2, -1000) -- very conservative rewrite limit
-			"monero" -> do
-				httpRequest <- H.parseRequest $ withDefaultApiUrl "http://127.0.0.1:18081/json_rpc"
-				return (SomeBlockChain $ newMonero httpManager httpRequest, 0, -60) -- conservative rewrite limit
-			"nem" -> do
-				httpRequest <- H.parseRequest $ withDefaultApiUrl "http://127.0.0.1:7890/"
-				return (SomeBlockChain $ newNem httpManager httpRequest, 1, -360) -- actual rewrite limit
-			"neo" -> do
-				httpRequest <- H.parseRequest $ withDefaultApiUrl "http://127.0.0.1:10332/"
-				return (SomeBlockChain $ newNeo httpManager httpRequest, 0, -1000) -- very conservative rewrite limit
-			"ripple" -> do
-				httpRequest <- H.parseRequest $ withDefaultApiUrl "https://data.ripple.com/"
-				return (SomeBlockChain $ newRipple httpManager httpRequest, 32570, 0) -- history data, no rewrites
-			"stellar" -> do
-				httpRequest <- H.parseRequest $ withDefaultApiUrl "http://history.stellar.org/prd/core-live/core_live_001"
-				stellar <- newStellar httpManager httpRequest (2 + threadsCount `quot` 64)
-				return (SomeBlockChain stellar, 1, 0) -- history data, no rewrites
 			_ -> fail "wrong blockchain specified"
 
 		-- get begin block, from output postgres if needed
@@ -365,81 +310,6 @@ run Options
 		writeOutput outputFile blockchainType =<< step beginBlock
 		hPutStrLn stderr $ "sync from " ++ show beginBlock ++ " to " ++ show (endBlock - 1) ++ " complete"
 
-	OptionExportIotaCommand
-		{ options_apiUrl = apiUrl
-		, options_syncDbFile = syncDbFile
-		, options_outputFile = outputFile
-		, options_threadsCount = threadsCount
-		} -> do
-		httpManager <- H.newTlsManagerWith H.tlsManagerSettings
-			{ H.managerConnCount = threadsCount * 2
-			}
-		httpRequest <- H.parseRequest apiUrl
-		let iota = newIota httpManager httpRequest
-
-		-- simple multithreaded pipeline
-		hashQueue <- newTQueueIO
-		transactionQueue <- newTBQueueIO (threadsCount * 2)
-
-		queueSizeVar <- newTVarIO 0 :: IO (TVar Int)
-
-		-- thread working with sync db
-		syncDbActionsQueue <- newTQueueIO
-		void $ forkIO $ DH.withDiskHashRW syncDbFile 82 $ \syncDb -> forever $ do
-			action <- atomically $ readTQueue syncDbActionsQueue
-			action syncDb
-
-		let addHash hash@(T.encodeUtf8 -> hashBytes) = atomically $ writeTQueue syncDbActionsQueue $ \syncDb -> do
-			hashProcessed <- isJust <$> DH.htLookupRW hashBytes syncDb
-			unless (hashProcessed) $ do
-				ok <- DH.htInsert hashBytes () syncDb
-				unless ok $ fail "can't write into sync db"
-				atomically $ do
-					writeTQueue hashQueue hash
-					modifyTVar' queueSizeVar (+ 1)
-
-		let takeHashes limit = let
-			step n hashes = if n <= (0 :: Int) then return hashes else do
-				maybeHash <- tryReadTQueue hashQueue
-				case maybeHash of
-					Just hash -> do
-						modifyTVar' queueSizeVar (subtract 1)
-						step (n - 1) (hash : hashes)
-					Nothing -> return hashes
-			in step limit []
-
-		-- thread adding milestones to hash queue
-		void $ forkIO $ forever $ do
-			-- get milestone
-			latestMilestoneHash <- iotaGetLatestMilestone iota
-			hPutStrLn stderr $ "latest milestone: " <> T.unpack latestMilestoneHash
-			-- put milestone into queue
-			addHash latestMilestoneHash
-			-- output queue size
-			queueSize <- readTVarIO queueSizeVar
-			hPutStrLn stderr $ "queue size: " <> show queueSize
-			-- pause
-			threadDelay 10000000
-
-		-- work threads getting transactions from blockchain
-		forM_ [1..threadsCount] $ const $ forkIO $ forever $ do
-			hashes <- V.fromList <$> atomically (takeHashes 1000)
-			transactions <- iotaGetTransactions iota hashes
-			forM_ transactions $ \transaction@IotaTransaction
-				{ it_trunkTransaction = trunkTransaction
-				, it_branchTransaction = branchTransaction
-				} -> do
-				atomically $ writeTBQueue transactionQueue transaction
-				addHash trunkTransaction
-				addHash branchTransaction
-
-		-- write blocks into outputs, using lazy IO
-		let step i = unsafeInterleaveIO $ do
-			transaction <- atomically $ readTBQueue transactionQueue
-			when (i `rem` 100 == 0) $ hPutStrLn stderr $ "synced transactions: " ++ show i
-			(transaction :) <$> step (i + 1)
-		writeOutput outputFile "iota" =<< step (0 :: Int)
-
 	OptionPrintSchemaCommand
 		{ options_schema = schemaTypeStr
 		, options_storage = storageTypeStr
@@ -458,71 +328,6 @@ run Options
 			putStrLn $ T.unpack $ TL.toStrict $ TL.toLazyText $ "CREATE TABLE erc20tokens (" <> concatFields (postgresSchemaFields True $ schemaOf (Proxy :: Proxy ERC20Info)) <> ");"
 		("erc20tokens", "bigquery") ->
 			putStrLn $ T.unpack $ T.decodeUtf8 $ BL.toStrict $ J.encode $ bigQuerySchema $ schemaOf (Proxy :: Proxy ERC20Info)
-		("cardano", "postgres") -> do
-			putStr $ T.unpack $ TL.toStrict $ TL.toLazyText $ mconcat $ map postgresSqlCreateType
-				[ schemaOf (Proxy :: Proxy CardanoInput)
-				, schemaOf (Proxy :: Proxy CardanoOutput)
-				, schemaOf (Proxy :: Proxy CardanoTransaction)
-				, schemaOf (Proxy :: Proxy CardanoBlock)
-				]
-			putStrLn $ T.unpack $ "CREATE TABLE \"cardano\" OF \"CardanoBlock\" (PRIMARY KEY (\"height\"));"
-		("cardano", "bigquery") ->
-			putStrLn $ T.unpack $ T.decodeUtf8 $ BL.toStrict $ J.encode $ bigQuerySchema $ schemaOf (Proxy :: Proxy CardanoBlock)
-		("iota", "postgres") -> do
-			putStr $ T.unpack $ TL.toStrict $ TL.toLazyText $ mconcat $ map postgresSqlCreateType
-				[ schemaOf (Proxy :: Proxy IotaTransaction)
-				]
-			putStrLn $ T.unpack $ "CREATE TABLE \"iota\" OF \"IotaTransaction\" (PRIMARY KEY (\"hash\"));"
-		("iota", "bigquery") ->
-			putStrLn $ T.unpack $ T.decodeUtf8 $ BL.toStrict $ J.encode $ bigQuerySchema $ schemaOf (Proxy :: Proxy IotaTransaction)
-		("monero", "postgres") -> do
-			putStr $ T.unpack $ TL.toStrict $ TL.toLazyText $ mconcat $ map postgresSqlCreateType
-				[ schemaOf (Proxy :: Proxy MoneroTransactionInput)
-				, schemaOf (Proxy :: Proxy MoneroTransactionOutput)
-				, schemaOf (Proxy :: Proxy MoneroTransaction)
-				, schemaOf (Proxy :: Proxy MoneroBlock)
-				]
-			putStrLn $ T.unpack $ "CREATE TABLE \"monero\" OF \"MoneroBlock\" (PRIMARY KEY (\"height\"));"
-		("monero", "bigquery") ->
-			putStrLn $ T.unpack $ T.decodeUtf8 $ BL.toStrict $ J.encode $ bigQuerySchema $ schemaOf (Proxy :: Proxy MoneroBlock)
-		("nem", "postgres") -> do
-			putStr $ T.unpack $ TL.toStrict $ TL.toLazyText $ mconcat $ map postgresSqlCreateType
-				[ schemaOf (Proxy :: Proxy NemNestedTransaction)
-				, schemaOf (Proxy :: Proxy NemTransaction)
-				, schemaOf (Proxy :: Proxy NemBlock)
-				]
-			putStrLn $ T.unpack $ "CREATE TABLE \"nem\" OF \"NemBlock\" (PRIMARY KEY (\"height\"));"
-		("nem", "bigquery") ->
-			putStrLn $ T.unpack $ T.decodeUtf8 $ BL.toStrict $ J.encode $ bigQuerySchema $ schemaOf (Proxy :: Proxy NemBlock)
-		("neo", "postgres") -> do
-			putStr $ T.unpack $ TL.toStrict $ TL.toLazyText $ mconcat $ map postgresSqlCreateType
-				[ schemaOf (Proxy :: Proxy NeoTransactionInput)
-				, schemaOf (Proxy :: Proxy NeoTransactionOutput)
-				, schemaOf (Proxy :: Proxy NeoTransaction)
-				, schemaOf (Proxy :: Proxy NeoBlock)
-				]
-			putStrLn $ T.unpack $ "CREATE TABLE \"neo\" OF \"NeoBlock\" (PRIMARY KEY (\"index\"));"
-		("neo", "bigquery") ->
-			putStrLn $ T.unpack $ T.decodeUtf8 $ BL.toStrict $ J.encode $ bigQuerySchema $ schemaOf (Proxy :: Proxy NeoBlock)
-		("ripple", "postgres") -> do
-			putStr $ T.unpack $ TL.toStrict $ TL.toLazyText $ mconcat $ map postgresSqlCreateType
-				[ schemaOf (Proxy :: Proxy RippleTransaction)
-				, schemaOf (Proxy :: Proxy RippleLedger)
-				]
-			putStrLn $ T.unpack $ "CREATE TABLE \"ripple\" OF \"RippleLedger\" (PRIMARY KEY (\"index\"));"
-		("ripple", "bigquery") ->
-			putStrLn $ T.unpack $ T.decodeUtf8 $ BL.toStrict $ J.encode $ bigQuerySchema $ schemaOf (Proxy :: Proxy RippleLedger)
-		("stellar", "postgres") -> do
-			putStr $ T.unpack $ TL.toStrict $ TL.toLazyText $ mconcat $ map postgresSqlCreateType
-				[ schemaOf (Proxy :: Proxy StellarAsset)
-				, schemaOf (Proxy :: Proxy StellarOperation)
-				, schemaOf (Proxy :: Proxy StellarTransaction)
-				, schemaOf (Proxy :: Proxy StellarLedger)
-				]
-			putStrLn $ T.unpack $ "CREATE TABLE \"stellar\" OF \"StellarLedger\" (PRIMARY KEY (\"sequence\"));"
-		("stellar", "bigquery") ->
-			putStrLn $ T.unpack $ T.decodeUtf8 $ BL.toStrict $ J.encode $ bigQuerySchema $ schemaOf (Proxy :: Proxy StellarLedger)
-		_ -> fail "wrong pair schema+storage"
 
 	OptionExportERC20InfoCommand
 		{ options_inputJsonFile = inputJsonFile
